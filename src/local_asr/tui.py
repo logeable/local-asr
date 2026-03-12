@@ -101,7 +101,8 @@ def render_status(state: UIState) -> Panel:
 
 
 def render_stable(state: UIState) -> Panel:
-    return Panel(state.transcript.stable or "-", title="Stable")
+    stable_lines = list(state.transcript.stable_lines)
+    return Panel("\n".join(stable_lines) if stable_lines else "-", title="Stable")
 
 
 def render_partial(state: UIState) -> Panel:

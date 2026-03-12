@@ -25,8 +25,8 @@ class SessionState:
 @dataclass(slots=True)
 class TranscriptState:
     partial: str = ""
-    stable: str = ""
-    stable_window_chars: int = 80
+    stable_total: str = ""
+    stable_lines: Deque[str] = field(default_factory=lambda: deque(maxlen=12))
 
 
 @dataclass(slots=True)
@@ -79,10 +79,14 @@ class UIState:
         if event.level == "partial":
             self.transcript.partial = event.text
         elif event.level == "stable":
-            self.transcript.stable = rolling_tail(event.text, self.transcript.stable_window_chars)
+            stable_delta = event.text[len(self.transcript.stable_total) :] if event.text.startswith(self.transcript.stable_total) else event.text
+            self.transcript.stable_total = event.text
+            if stable_delta:
+                self.transcript.stable_lines.append(stable_delta)
         elif event.level == "final":
             self.transcript.partial = ""
-            self.transcript.stable = ""
+            self.transcript.stable_total = ""
+            self.transcript.stable_lines.clear()
 
     def apply_metrics(self, event: MetricsEvent) -> None:
         self.metrics.queue_current = event.queue_current
@@ -107,9 +111,3 @@ class UIState:
 
     def apply_log(self, event: LogEvent) -> None:
         self.logs.appendleft(event)
-
-
-def rolling_tail(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[-max_chars:]
