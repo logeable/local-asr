@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 DEFAULT_ASR_MODEL = "paraformer-zh-streaming"
-DEFAULT_ENCODER_LOOK_BACK = 4
-DEFAULT_DECODER_LOOK_BACK = 1
+DEFAULT_ENCODER_LOOK_BACK = 6
+DEFAULT_DECODER_LOOK_BACK = 2
 
 if TYPE_CHECKING:
     import numpy as np
@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recognize_parser.add_argument(
         "--chunk-size",
-        default="0,10,5",
+        default="0,12,6",
         help="FunASR online chunk size, formatted as a,b,c. Default: 0,10,5.",
     )
     recognize_parser.add_argument(
