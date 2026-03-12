@@ -66,6 +66,7 @@ def build_layout() -> Layout:
     layout.split_column(
         Layout(name="status", size=3),
         Layout(name="body", ratio=3),
+        Layout(name="final", ratio=2),
         Layout(name="bottom", ratio=2),
     )
     layout["body"].split_row(
@@ -82,6 +83,7 @@ def render_layout(layout: Layout, state: UIState) -> None:
     layout["stable"].update(render_stable(state))
     layout["partial"].update(render_partial(state))
     layout["metrics"].update(render_metrics(state))
+    layout["final"].update(render_final(state))
     layout["logs"].update(render_logs(state))
     layout["debug"].update(render_debug(state))
 
@@ -107,6 +109,11 @@ def render_stable(state: UIState) -> Panel:
 
 def render_partial(state: UIState) -> Panel:
     return Panel(state.transcript.partial or "-", title="Partial")
+
+
+def render_final(state: UIState) -> Panel:
+    final_lines = list(state.transcript.final_lines)
+    return Panel("\n".join(final_lines) if final_lines else "-", title="Final")
 
 
 def render_metrics(state: UIState) -> Panel:

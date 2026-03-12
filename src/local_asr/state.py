@@ -27,6 +27,7 @@ class TranscriptState:
     partial: str = ""
     stable_total: str = ""
     stable_lines: Deque[str] = field(default_factory=lambda: deque(maxlen=12))
+    final_lines: Deque[str] = field(default_factory=lambda: deque(maxlen=12))
 
 
 @dataclass(slots=True)
@@ -85,6 +86,8 @@ class UIState:
             if stable_delta:
                 self.transcript.stable_lines.append(stable_delta)
         elif event.level == "final":
+            if event.text:
+                self.transcript.final_lines.append(event.text)
             self.transcript.partial = ""
             self.transcript.stable_total = ""
             self.transcript.stable_lines.clear()
