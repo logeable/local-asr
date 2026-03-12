@@ -8,6 +8,7 @@
 - 从麦克风实时采集音频
 - 使用 `FunASR` 在线流式模型做实时识别
 - 支持列出设备、预热下载模型、实时打印流式识别结果
+- 支持 TUI 终端监控面板，分区展示转写、指标、日志和调试信息
 
 ## 环境要求
 
@@ -40,7 +41,7 @@ uv run local-asr warmup
 默认模型是：
 
 ```bash
-iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online
+paraformer-zh-streaming
 ```
 
 ## 启动实时识别
@@ -49,6 +50,18 @@ iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online
 
 ```bash
 uv run local-asr recognize
+```
+
+使用 TUI 面板：
+
+```bash
+uv run local-asr recognize --ui tui
+```
+
+如果只想保留传统文本输出：
+
+```bash
+uv run local-asr recognize --ui plain
 ```
 
 指定设备：
@@ -60,7 +73,7 @@ uv run local-asr recognize --device 0
 指定模型：
 
 ```bash
-uv run local-asr recognize --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online
+uv run local-asr recognize --model paraformer-zh-streaming
 ```
 
 隐藏中间流式输出：

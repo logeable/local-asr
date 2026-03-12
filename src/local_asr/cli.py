@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import queue
 import sys
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from .events import DebugEvent, LogEvent, MetricsEvent, SessionEvent, TranscriptEvent
+from .tui import RuntimeEvent, TUIRunner
 
 DEFAULT_ASR_MODEL = "paraformer-zh-streaming"
 DEFAULT_ENCODER_LOOK_BACK = 6
@@ -20,6 +24,27 @@ if TYPE_CHECKING:
 class AudioChunk:
     data: bytes
     overflowed: bool = False
+
+
+@dataclass(slots=True)
+class RuntimeStats:
+    started_at: float
+    queue_max: int = 0
+    audio_chunks_received: int = 0
+    audio_overflows: int = 0
+    inference_calls: int = 0
+    inference_empty_results: int = 0
+    final_sentences: int = 0
+    total_infer_ms: float = 0.0
+    last_infer_ms: float = 0.0
+    last_rtf: float = 0.0
+
+
+@dataclass(slots=True)
+class TranscriptRuntimeState:
+    last_text: str = ""
+    stable_text: str = ""
+    partial_text: str = ""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     recognize_parser.add_argument(
         "--chunk-size",
         default="0,12,6",
-        help="FunASR online chunk size, formatted as a,b,c. Default: 0,10,5.",
+        help="FunASR online chunk size, formatted as a,b,c. Default: 0,12,6.",
     )
     recognize_parser.add_argument(
         "--encoder-look-back",
@@ -73,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     recognize_parser.add_argument(
         "--hide-intermediate",
         action="store_true",
-        help="Do not print intermediate streaming text chunks.",
+        help="Do not print intermediate streaming text chunks in plain mode.",
     )
     recognize_parser.add_argument(
         "--device-mode",
@@ -91,6 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-update-check",
         action="store_true",
         help="Disable FunASR version update checks.",
+    )
+    recognize_parser.add_argument(
+        "--ui",
+        choices=["plain", "tui"],
+        default="tui",
+        help="Output mode. Use `tui` for the multi-panel terminal view.",
     )
     recognize_parser.set_defaults(handler=handle_recognize)
 
@@ -132,20 +163,49 @@ def handle_recognize(args: argparse.Namespace) -> None:
 
     model = build_asr_model(args)
     device = parse_device(args.device)
+    device_name = resolve_device_name(device)
+    resolved_device_mode = detect_torch_device(args.device_mode)
     chunk_size = parse_chunk_size(args.chunk_size)
     chunk_stride = chunk_size[1] * 960
     if args.samplerate != 16000:
         raise ValueError("The default streaming model expects 16kHz audio. Use --samplerate 16000.")
 
     audio_queue: queue.Queue[AudioChunk] = queue.Queue()
+    event_queue: "queue.Queue[RuntimeEvent]" = queue.Queue()
+    stats = RuntimeStats(started_at=time.time())
+    transcript_state = TranscriptRuntimeState()
+    tui_runner = TUIRunner(event_queue) if args.ui == "tui" else None
 
     def callback(indata: bytes, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
         del frames, time_info
+        stats.audio_chunks_received += 1
+        if status.input_overflow:
+            stats.audio_overflows += 1
         audio_queue.put(AudioChunk(bytes(indata), bool(status.input_overflow)))
+        publish_metrics(event_queue, stats, audio_queue.qsize())
 
-    print(f"Using FunASR model: {args.model}")
-    print(f"Chunk size: {list(chunk_size)} | stride_samples={chunk_stride} | device={args.device_mode}")
-    print("Start speaking. Press Ctrl+C to stop.")
+    if tui_runner is not None:
+        tui_runner.start()
+    else:
+        print(f"Using FunASR model: {args.model}")
+        print(f"Chunk size: {list(chunk_size)} | stride_samples={chunk_stride} | device={resolved_device_mode}")
+        print("Start speaking. Press Ctrl+C to stop.")
+
+    publish(
+        event_queue,
+        SessionEvent(
+            state="starting",
+            device_name=device_name,
+            device_mode=resolved_device_mode,
+            model_name=args.model,
+            samplerate=args.samplerate,
+            blocksize=args.blocksize,
+            chunk_size=chunk_size,
+            encoder_look_back=args.encoder_look_back,
+            decoder_look_back=args.decoder_look_back,
+        ),
+    )
+    publish(event_queue, LogEvent(level="INFO", message="Microphone stream initializing"))
 
     try:
         with sd.RawInputStream(
@@ -156,54 +216,104 @@ def handle_recognize(args: argparse.Namespace) -> None:
             channels=1,
             callback=callback,
         ):
+            publish(
+                event_queue,
+                SessionEvent(
+                    state="running",
+                    device_name=device_name,
+                    device_mode=resolved_device_mode,
+                    model_name=args.model,
+                    samplerate=args.samplerate,
+                    blocksize=args.blocksize,
+                    chunk_size=chunk_size,
+                    encoder_look_back=args.encoder_look_back,
+                    decoder_look_back=args.decoder_look_back,
+                ),
+            )
+            publish(event_queue, LogEvent(level="INFO", message="Microphone stream running"))
             render_stream(
                 model,
                 audio_queue,
+                event_queue=event_queue,
+                stats=stats,
+                transcript_state=transcript_state,
                 chunk_stride=chunk_stride,
                 chunk_size=chunk_size,
                 encoder_look_back=args.encoder_look_back,
                 decoder_look_back=args.decoder_look_back,
                 show_intermediate=not args.hide_intermediate,
+                ui_mode=args.ui,
                 np_module=np,
             )
     except KeyboardInterrupt:
-        print("\nStopped.")
+        publish(event_queue, LogEvent(level="INFO", message="Stopped by user"))
+    finally:
+        publish(
+            event_queue,
+            SessionEvent(
+                state="stopped",
+                device_name=device_name,
+                device_mode=resolved_device_mode,
+                model_name=args.model,
+                samplerate=args.samplerate,
+                blocksize=args.blocksize,
+                chunk_size=chunk_size,
+                encoder_look_back=args.encoder_look_back,
+                decoder_look_back=args.decoder_look_back,
+            ),
+        )
+        if tui_runner is not None:
+            time.sleep(0.2)
+            tui_runner.stop()
+        else:
+            print("\nStopped.")
 
 
 def render_stream(
     model: Any,
     audio_queue: "queue.Queue[AudioChunk]",
     *,
+    event_queue: "queue.Queue[RuntimeEvent]",
+    stats: RuntimeStats,
+    transcript_state: TranscriptRuntimeState,
     chunk_stride: int,
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
     decoder_look_back: int,
     show_intermediate: bool,
+    ui_mode: str,
     np_module: Any,
 ) -> None:
     cache: dict[str, Any] = {}
     pending = bytearray()
-    last_text = ""
     try:
         while True:
             chunk = audio_queue.get()
+            stats.queue_max = max(stats.queue_max, audio_queue.qsize())
             if chunk.overflowed:
-                print("\n[warn] input overflow detected; consider increasing --blocksize.")
+                message = "Input overflow detected; consider increasing --blocksize"
+                publish(event_queue, LogEvent(level="WARN", message=message))
+                if ui_mode == "plain":
+                    print(f"\n[warn] {message}.")
             pending.extend(chunk.data)
             step_bytes = chunk_stride * 2
             while len(pending) >= step_bytes:
                 current = bytes(pending[:step_bytes])
                 del pending[:step_bytes]
-                last_text = emit_stream_result(
+                emit_stream_result(
                     model=model,
                     pcm_bytes=current,
                     cache=cache,
+                    event_queue=event_queue,
+                    stats=stats,
+                    transcript_state=transcript_state,
+                    audio_queue_size=audio_queue.qsize(),
                     chunk_size=chunk_size,
                     encoder_look_back=encoder_look_back,
                     decoder_look_back=decoder_look_back,
                     is_final=False,
                     show_intermediate=show_intermediate,
-                    last_text=last_text,
+                    ui_mode=ui_mode,
                     np_module=np_module,
                 )
     except KeyboardInterrupt:
@@ -211,11 +321,14 @@ def render_stream(
             model=model,
             pending=pending,
             cache=cache,
+            event_queue=event_queue,
+            stats=stats,
+            transcript_state=transcript_state,
             chunk_stride=chunk_stride,
             chunk_size=chunk_size,
             encoder_look_back=encoder_look_back,
             decoder_look_back=decoder_look_back,
-            last_text=last_text,
+            ui_mode=ui_mode,
             np_module=np_module,
         )
         raise
@@ -226,15 +339,20 @@ def emit_stream_result(
     model: Any,
     pcm_bytes: bytes,
     cache: dict[str, Any],
+    event_queue: "queue.Queue[RuntimeEvent]",
+    stats: RuntimeStats,
+    transcript_state: TranscriptRuntimeState,
+    audio_queue_size: int,
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
     decoder_look_back: int,
     is_final: bool,
     show_intermediate: bool,
-    last_text: str,
+    ui_mode: str,
     np_module: Any,
-) -> str:
+) -> None:
     audio = np_module.frombuffer(pcm_bytes, dtype=np_module.int16).astype(np_module.float32) / 32768.0
+    start = time.perf_counter()
     results = model.generate(
         input=audio,
         cache=cache,
@@ -243,17 +361,57 @@ def emit_stream_result(
         encoder_chunk_look_back=encoder_look_back,
         decoder_chunk_look_back=decoder_look_back,
     )
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    stats.inference_calls += 1
+    stats.last_infer_ms = elapsed_ms
+    stats.total_infer_ms += elapsed_ms
+    audio_seconds = len(audio) / 16000.0
+    stats.last_rtf = (elapsed_ms / 1000.0) / audio_seconds if audio_seconds > 0 else 0.0
+
     if not isinstance(results, list):
-        return last_text
+        stats.inference_empty_results += 1
+        publish_metrics(event_queue, stats, audio_queue_size)
+        return
+
+    emitted_text = False
     for result in results:
         text = str(result.get("text", "")).strip()
-        if not text or text == last_text:
+        if not text:
             continue
-        tag = "final" if is_final else "stream"
-        if show_intermediate or is_final:
-            print(f"[{tag}] {text}")
-        last_text = text
-    return last_text
+        emitted_text = True
+        stable_text, partial_text = split_transcript_parts(transcript_state.last_text, text)
+        if stable_text and stable_text != transcript_state.stable_text:
+            transcript_state.stable_text = stable_text
+            publish(event_queue, TranscriptEvent(level="stable", text=stable_text))
+        if partial_text and partial_text != transcript_state.partial_text:
+            transcript_state.partial_text = partial_text
+            publish(event_queue, TranscriptEvent(level="partial", text=partial_text))
+        if is_final:
+            stats.final_sentences += 1
+            transcript_state.stable_text = ""
+            transcript_state.partial_text = ""
+            publish(event_queue, TranscriptEvent(level="final", text=text))
+            publish(event_queue, LogEvent(level="INFO", message=f"Final sentence: {text}"))
+            if ui_mode == "plain":
+                print(f"[final] {text}")
+        elif show_intermediate and ui_mode == "plain":
+            print(f"[stream] {text}")
+        transcript_state.last_text = text
+
+    if not emitted_text:
+        stats.inference_empty_results += 1
+
+    publish(
+        event_queue,
+        DebugEvent(
+            raw_chunk_text=transcript_state.last_text,
+            stable_text=transcript_state.stable_text,
+            partial_text=transcript_state.partial_text,
+            cache_summary=summarize_cache(cache),
+            last_infer_ms=elapsed_ms,
+        ),
+    )
+    publish_metrics(event_queue, stats, audio_queue_size)
 
 
 def add_model_arguments(parser: argparse.ArgumentParser) -> None:
@@ -311,16 +469,32 @@ def parse_device(raw_device: str | None) -> int | str | None:
         return raw_device
 
 
+def resolve_device_name(device: int | str | None) -> str:
+    import sounddevice as sd
+
+    if device is None:
+        default_input, _ = sd.default.device
+        device = default_input
+    try:
+        info = sd.query_devices(device)
+        return str(info.get("name", device))
+    except Exception:
+        return str(device)
+
+
 def flush_remaining_audio(
     *,
     model: Any,
     pending: bytearray,
     cache: dict[str, Any],
+    event_queue: "queue.Queue[RuntimeEvent]",
+    stats: RuntimeStats,
+    transcript_state: TranscriptRuntimeState,
     chunk_stride: int,
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
     decoder_look_back: int,
-    last_text: str,
+    ui_mode: str,
     np_module: Any,
 ) -> None:
     if not pending:
@@ -331,11 +505,71 @@ def flush_remaining_audio(
         model=model,
         pcm_bytes=padded[:step_bytes],
         cache=cache,
+        event_queue=event_queue,
+        stats=stats,
+        transcript_state=transcript_state,
+        audio_queue_size=0,
         chunk_size=chunk_size,
         encoder_look_back=encoder_look_back,
         decoder_look_back=decoder_look_back,
         is_final=True,
         show_intermediate=True,
-        last_text=last_text,
+        ui_mode=ui_mode,
         np_module=np_module,
     )
+
+
+def publish(event_queue: "queue.Queue[RuntimeEvent]", event: RuntimeEvent) -> None:
+    try:
+        event_queue.put_nowait(event)
+    except queue.Full:
+        pass
+
+
+def publish_metrics(event_queue: "queue.Queue[RuntimeEvent]", stats: RuntimeStats, queue_current: int) -> None:
+    now = time.time()
+    elapsed = max(now - stats.started_at, 1e-6)
+    publish(
+        event_queue,
+        MetricsEvent(
+            queue_current=queue_current,
+            queue_max=max(stats.queue_max, queue_current),
+            audio_chunks_received=stats.audio_chunks_received,
+            audio_overflows=stats.audio_overflows,
+            inference_calls=stats.inference_calls,
+            inference_empty_results=stats.inference_empty_results,
+            final_sentences=stats.final_sentences,
+            avg_infer_ms=stats.total_infer_ms / stats.inference_calls if stats.inference_calls else 0.0,
+            last_infer_ms=stats.last_infer_ms,
+            rtf_current=stats.last_rtf,
+            rtf_avg=((stats.total_infer_ms / 1000.0) / elapsed),
+            chunk_rate=stats.audio_chunks_received / elapsed,
+        ),
+    )
+
+
+def split_transcript_parts(previous: str, current: str) -> tuple[str, str]:
+    prefix_chars = []
+    for old_char, new_char in zip(previous, current):
+        if old_char != new_char:
+            break
+        prefix_chars.append(new_char)
+    stable = "".join(prefix_chars)
+    partial = current[len(stable) :]
+    return stable, partial
+
+
+def summarize_cache(cache: dict[str, Any]) -> str:
+    if not cache:
+        return "-"
+    parts = []
+    for key, value in sorted(cache.items()):
+        if isinstance(value, dict):
+            parts.append(f"{key}={len(value)}")
+        elif isinstance(value, (list, tuple)):
+            parts.append(f"{key}[{len(value)}]")
+        elif hasattr(value, "shape"):
+            parts.append(f"{key}{tuple(value.shape)}")
+        else:
+            parts.append(f"{key}={type(value).__name__}")
+    return ", ".join(parts)
