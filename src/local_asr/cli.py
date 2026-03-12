@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .aggregate import TranscriptAggregator
 from .events import DebugEvent, LogEvent, MetricsEvent, SessionEvent, TranscriptEvent
 from .tui import RuntimeEvent, TUIRunner
 
@@ -38,13 +39,6 @@ class RuntimeStats:
     total_infer_ms: float = 0.0
     last_infer_ms: float = 0.0
     last_rtf: float = 0.0
-
-
-@dataclass(slots=True)
-class TranscriptRuntimeState:
-    last_text: str = ""
-    stable_text: str = ""
-    partial_text: str = ""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -173,7 +167,7 @@ def handle_recognize(args: argparse.Namespace) -> None:
     audio_queue: queue.Queue[AudioChunk] = queue.Queue()
     event_queue: "queue.Queue[RuntimeEvent]" = queue.Queue()
     stats = RuntimeStats(started_at=time.time())
-    transcript_state = TranscriptRuntimeState()
+    aggregator = TranscriptAggregator()
     tui_runner = TUIRunner(event_queue) if args.ui == "tui" else None
 
     def callback(indata: bytes, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
@@ -236,7 +230,7 @@ def handle_recognize(args: argparse.Namespace) -> None:
                 audio_queue,
                 event_queue=event_queue,
                 stats=stats,
-                transcript_state=transcript_state,
+                aggregator=aggregator,
                 chunk_stride=chunk_stride,
                 chunk_size=chunk_size,
                 encoder_look_back=args.encoder_look_back,
@@ -275,7 +269,7 @@ def render_stream(
     *,
     event_queue: "queue.Queue[RuntimeEvent]",
     stats: RuntimeStats,
-    transcript_state: TranscriptRuntimeState,
+    aggregator: TranscriptAggregator,
     chunk_stride: int,
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
@@ -306,7 +300,7 @@ def render_stream(
                     cache=cache,
                     event_queue=event_queue,
                     stats=stats,
-                    transcript_state=transcript_state,
+                    aggregator=aggregator,
                     audio_queue_size=audio_queue.qsize(),
                     chunk_size=chunk_size,
                     encoder_look_back=encoder_look_back,
@@ -323,7 +317,7 @@ def render_stream(
             cache=cache,
             event_queue=event_queue,
             stats=stats,
-            transcript_state=transcript_state,
+            aggregator=aggregator,
             chunk_stride=chunk_stride,
             chunk_size=chunk_size,
             encoder_look_back=encoder_look_back,
@@ -341,7 +335,7 @@ def emit_stream_result(
     cache: dict[str, Any],
     event_queue: "queue.Queue[RuntimeEvent]",
     stats: RuntimeStats,
-    transcript_state: TranscriptRuntimeState,
+    aggregator: TranscriptAggregator,
     audio_queue_size: int,
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
@@ -370,6 +364,8 @@ def emit_stream_result(
 
     if not isinstance(results, list):
         stats.inference_empty_results += 1
+        for event in aggregator.feed("", is_final_chunk=is_final):
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate)
         publish_metrics(event_queue, stats, audio_queue_size)
         return
 
@@ -379,34 +375,20 @@ def emit_stream_result(
         if not text:
             continue
         emitted_text = True
-        stable_text, partial_text = split_transcript_parts(transcript_state.last_text, text)
-        if stable_text and stable_text != transcript_state.stable_text:
-            transcript_state.stable_text = stable_text
-            publish(event_queue, TranscriptEvent(level="stable", text=stable_text))
-        if partial_text and partial_text != transcript_state.partial_text:
-            transcript_state.partial_text = partial_text
-            publish(event_queue, TranscriptEvent(level="partial", text=partial_text))
-        if is_final:
-            stats.final_sentences += 1
-            transcript_state.stable_text = ""
-            transcript_state.partial_text = ""
-            publish(event_queue, TranscriptEvent(level="final", text=text))
-            publish(event_queue, LogEvent(level="INFO", message=f"Final sentence: {text}"))
-            if ui_mode == "plain":
-                print(f"[final] {text}")
-        elif show_intermediate and ui_mode == "plain":
-            print(f"[stream] {text}")
-        transcript_state.last_text = text
+        for event in aggregator.feed(text, is_final_chunk=is_final):
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate)
 
     if not emitted_text:
         stats.inference_empty_results += 1
+        for event in aggregator.feed("", is_final_chunk=is_final):
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate)
 
     publish(
         event_queue,
         DebugEvent(
-            raw_chunk_text=transcript_state.last_text,
-            stable_text=transcript_state.stable_text,
-            partial_text=transcript_state.partial_text,
+            raw_chunk_text=aggregator.last_text,
+            stable_text=aggregator.stable_text,
+            partial_text=aggregator.partial_text,
             cache_summary=summarize_cache(cache),
             last_infer_ms=elapsed_ms,
         ),
@@ -489,7 +471,7 @@ def flush_remaining_audio(
     cache: dict[str, Any],
     event_queue: "queue.Queue[RuntimeEvent]",
     stats: RuntimeStats,
-    transcript_state: TranscriptRuntimeState,
+    aggregator: TranscriptAggregator,
     chunk_stride: int,
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
@@ -507,7 +489,7 @@ def flush_remaining_audio(
         cache=cache,
         event_queue=event_queue,
         stats=stats,
-        transcript_state=transcript_state,
+        aggregator=aggregator,
         audio_queue_size=0,
         chunk_size=chunk_size,
         encoder_look_back=encoder_look_back,
@@ -548,15 +530,21 @@ def publish_metrics(event_queue: "queue.Queue[RuntimeEvent]", stats: RuntimeStat
     )
 
 
-def split_transcript_parts(previous: str, current: str) -> tuple[str, str]:
-    prefix_chars = []
-    for old_char, new_char in zip(previous, current):
-        if old_char != new_char:
-            break
-        prefix_chars.append(new_char)
-    stable = "".join(prefix_chars)
-    partial = current[len(stable) :]
-    return stable, partial
+def handle_transcript_event(
+    event_queue: "queue.Queue[RuntimeEvent]",
+    stats: RuntimeStats,
+    event: TranscriptEvent,
+    ui_mode: str,
+    show_intermediate: bool,
+) -> None:
+    publish(event_queue, event)
+    if event.level == "final":
+        stats.final_sentences += 1
+        publish(event_queue, LogEvent(level="INFO", message=f"Final sentence: {event.text}"))
+        if ui_mode == "plain":
+            print(f"[final] {event.text}")
+    elif event.level == "partial" and show_intermediate and ui_mode == "plain":
+        print(f"[partial] {event.text}")
 
 
 def summarize_cache(cache: dict[str, Any]) -> str:
