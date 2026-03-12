@@ -183,7 +183,7 @@ def render_stream(
 ) -> None:
     cache: dict[str, Any] = {}
     pending = bytearray()
-    emitted_count = 0
+    last_text = ""
     try:
         while True:
             chunk = audio_queue.get()
@@ -194,7 +194,7 @@ def render_stream(
             while len(pending) >= step_bytes:
                 current = bytes(pending[:step_bytes])
                 del pending[:step_bytes]
-                emitted_count = emit_stream_result(
+                last_text = emit_stream_result(
                     model=model,
                     pcm_bytes=current,
                     cache=cache,
@@ -203,7 +203,7 @@ def render_stream(
                     decoder_look_back=decoder_look_back,
                     is_final=False,
                     show_intermediate=show_intermediate,
-                    emitted_count=emitted_count,
+                    last_text=last_text,
                     np_module=np_module,
                 )
     except KeyboardInterrupt:
@@ -215,7 +215,7 @@ def render_stream(
             chunk_size=chunk_size,
             encoder_look_back=encoder_look_back,
             decoder_look_back=decoder_look_back,
-            emitted_count=emitted_count,
+            last_text=last_text,
             np_module=np_module,
         )
         raise
@@ -231,11 +231,10 @@ def emit_stream_result(
     decoder_look_back: int,
     is_final: bool,
     show_intermediate: bool,
-    emitted_count: int,
+    last_text: str,
     np_module: Any,
-) -> int:
+) -> str:
     audio = np_module.frombuffer(pcm_bytes, dtype=np_module.int16).astype(np_module.float32) / 32768.0
-    print(audio)
     results = model.generate(
         input=audio,
         cache=cache,
@@ -245,16 +244,16 @@ def emit_stream_result(
         decoder_chunk_look_back=decoder_look_back,
     )
     if not isinstance(results, list):
-        return emitted_count
-    new_results = results[emitted_count:]
-    for result in new_results:
+        return last_text
+    for result in results:
         text = str(result.get("text", "")).strip()
-        if not text:
+        if not text or text == last_text:
             continue
         tag = "final" if is_final else "stream"
         if show_intermediate or is_final:
             print(f"[{tag}] {text}")
-    return len(results)
+        last_text = text
+    return last_text
 
 
 def add_model_arguments(parser: argparse.ArgumentParser) -> None:
@@ -278,6 +277,8 @@ def build_asr_model(args: argparse.Namespace) -> Any:
         model_revision=args.model_revision,
         device=detect_torch_device(getattr(args, "device_mode", "auto")),
         disable_update=getattr(args, "disable_update_check", True),
+        disable_pbar=True,
+        disable_log=True,
         ncpu=getattr(args, "ncpu", 4),
     )
 
@@ -319,7 +320,7 @@ def flush_remaining_audio(
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
     decoder_look_back: int,
-    emitted_count: int,
+    last_text: str,
     np_module: Any,
 ) -> None:
     if not pending:
@@ -335,6 +336,6 @@ def flush_remaining_audio(
         decoder_look_back=decoder_look_back,
         is_final=True,
         show_intermediate=True,
-        emitted_count=emitted_count,
+        last_text=last_text,
         np_module=np_module,
     )
