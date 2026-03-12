@@ -35,6 +35,7 @@ class MetricsState:
     queue_max: int = 0
     audio_chunks_received: int = 0
     audio_overflows: int = 0
+    silence_flushes: int = 0
     inference_calls: int = 0
     inference_empty_results: int = 0
     final_sentences: int = 0
@@ -93,6 +94,7 @@ class UIState:
         self.metrics.queue_max = event.queue_max
         self.metrics.audio_chunks_received = event.audio_chunks_received
         self.metrics.audio_overflows = event.audio_overflows
+        self.metrics.silence_flushes = event.silence_flushes
         self.metrics.inference_calls = event.inference_calls
         self.metrics.inference_empty_results = event.inference_empty_results
         self.metrics.final_sentences = event.final_sentences

@@ -32,6 +32,7 @@ class MetricsEvent:
     queue_max: int
     audio_chunks_received: int
     audio_overflows: int
+    silence_flushes: int
     inference_calls: int
     inference_empty_results: int
     final_sentences: int

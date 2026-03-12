@@ -118,6 +118,7 @@ def render_metrics(state: UIState) -> Panel:
         ("queue", f"{metrics.queue_current}/{metrics.queue_max}"),
         ("audio_chunks", str(metrics.audio_chunks_received)),
         ("overflows", str(metrics.audio_overflows)),
+        ("silence_flushes", str(metrics.silence_flushes)),
         ("infer_calls", str(metrics.inference_calls)),
         ("empty_results", str(metrics.inference_empty_results)),
         ("final_sentences", str(metrics.final_sentences)),

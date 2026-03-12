@@ -40,6 +40,7 @@ class RuntimeStats:
     total_infer_ms: float = 0.0
     last_infer_ms: float = 0.0
     last_rtf: float = 0.0
+    silence_flushes: int = 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -126,6 +127,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional file path. If set, final transcript lines are appended there.",
     )
+    recognize_parser.add_argument(
+        "--silence-threshold",
+        type=float,
+        default=0.01,
+        help="RMS threshold for detecting silence from audio chunks.",
+    )
+    recognize_parser.add_argument(
+        "--silence-duration-ms",
+        type=int,
+        default=800,
+        help="Silence duration in milliseconds before forcing a final flush.",
+    )
     recognize_parser.set_defaults(handler=handle_recognize)
 
     punctuate_parser = subparsers.add_parser("punctuate", help="Run punctuation restoration on text.")
@@ -208,6 +221,7 @@ def handle_recognize(args: argparse.Namespace) -> None:
     event_queue: "queue.Queue[RuntimeEvent]" = queue.Queue()
     stats = RuntimeStats(started_at=time.time())
     aggregator = TranscriptAggregator()
+    aggregator.silence_timeout_s = args.silence_duration_ms / 1000.0
     tui_runner = TUIRunner(event_queue) if args.ui == "tui" else None
 
     def callback(indata: bytes, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
@@ -279,6 +293,8 @@ def handle_recognize(args: argparse.Namespace) -> None:
                 punc_model=punc_model,
                 show_intermediate=not args.hide_intermediate,
                 ui_mode=args.ui,
+                silence_threshold=args.silence_threshold,
+                silence_duration_ms=args.silence_duration_ms,
                 np_module=np,
             )
     except KeyboardInterrupt:
@@ -317,12 +333,17 @@ def render_stream(
     encoder_look_back: int,
     decoder_look_back: int,
     final_output: Path | None,
+    punc_model: Any | None,
     show_intermediate: bool,
     ui_mode: str,
+    silence_threshold: float,
+    silence_duration_ms: int,
     np_module: Any,
 ) -> None:
     cache: dict[str, Any] = {}
     pending = bytearray()
+    silence_started_at: float | None = None
+    silence_duration_s = silence_duration_ms / 1000.0
     try:
         while True:
             chunk = audio_queue.get()
@@ -347,14 +368,56 @@ def render_stream(
                     audio_queue_size=audio_queue.qsize(),
                     chunk_size=chunk_size,
                     encoder_look_back=encoder_look_back,
-                decoder_look_back=decoder_look_back,
-                is_final=False,
+                    decoder_look_back=decoder_look_back,
+                    is_final=False,
+                    final_output=final_output,
+                    punc_model=punc_model,
+                    show_intermediate=show_intermediate,
+                    ui_mode=ui_mode,
+                    np_module=np_module,
+                )
+            chunk_rms = audio_rms(chunk.data, np_module)
+            now = time.time()
+            if chunk_rms >= silence_threshold:
+                silence_started_at = None
+                continue
+            silence_started_at = now if silence_started_at is None else silence_started_at
+            if not aggregator.has_pending_text() or now - silence_started_at < silence_duration_s:
+                continue
+            if pending:
+                padded = bytes(pending) + b"\x00" * max(0, step_bytes - len(pending))
+                pending.clear()
+                emit_stream_result(
+                    model=model,
+                    pcm_bytes=padded[:step_bytes],
+                    cache=cache,
+                    event_queue=event_queue,
+                    stats=stats,
+                    aggregator=aggregator,
+                    audio_queue_size=audio_queue.qsize(),
+                    chunk_size=chunk_size,
+                    encoder_look_back=encoder_look_back,
+                    decoder_look_back=decoder_look_back,
+                    is_final=False,
+                    final_output=final_output,
+                    punc_model=punc_model,
+                    show_intermediate=show_intermediate,
+                    ui_mode=ui_mode,
+                    np_module=np_module,
+                )
+            flush_transcript(
+                event_queue=event_queue,
+                stats=stats,
+                aggregator=aggregator,
+                ui_mode=ui_mode,
+                show_intermediate=show_intermediate,
                 final_output=final_output,
                 punc_model=punc_model,
-                show_intermediate=show_intermediate,
-                ui_mode=ui_mode,
-                np_module=np_module,
-                )
+                reason="Silence flush triggered",
+                count_as_silence_flush=True,
+            )
+            publish_metrics(event_queue, stats, audio_queue.qsize())
+            silence_started_at = None
     except KeyboardInterrupt:
         flush_remaining_audio(
             model=model,
@@ -559,27 +622,38 @@ def flush_remaining_audio(
     ui_mode: str,
     np_module: Any,
 ) -> None:
-    if not pending:
-        return
     step_bytes = chunk_stride * 2
-    padded = bytes(pending) + b"\x00" * max(0, step_bytes - len(pending))
-    emit_stream_result(
-        model=model,
-        pcm_bytes=padded[:step_bytes],
-        cache=cache,
+    if pending:
+        padded = bytes(pending) + b"\x00" * max(0, step_bytes - len(pending))
+        emit_stream_result(
+            model=model,
+            pcm_bytes=padded[:step_bytes],
+            cache=cache,
+            event_queue=event_queue,
+            stats=stats,
+            aggregator=aggregator,
+            audio_queue_size=0,
+            chunk_size=chunk_size,
+            encoder_look_back=encoder_look_back,
+            decoder_look_back=decoder_look_back,
+            is_final=True,
+            final_output=final_output,
+            punc_model=punc_model,
+            show_intermediate=True,
+            ui_mode=ui_mode,
+            np_module=np_module,
+        )
+        return
+    flush_transcript(
         event_queue=event_queue,
         stats=stats,
         aggregator=aggregator,
-        audio_queue_size=0,
-        chunk_size=chunk_size,
-        encoder_look_back=encoder_look_back,
-        decoder_look_back=decoder_look_back,
-        is_final=True,
+        ui_mode=ui_mode,
+        show_intermediate=True,
         final_output=final_output,
         punc_model=punc_model,
-        show_intermediate=True,
-        ui_mode=ui_mode,
-        np_module=np_module,
+        reason="Stream stopped; flushed pending transcript",
+        count_as_silence_flush=False,
     )
 
 
@@ -600,6 +674,7 @@ def publish_metrics(event_queue: "queue.Queue[RuntimeEvent]", stats: RuntimeStat
             queue_max=max(stats.queue_max, queue_current),
             audio_chunks_received=stats.audio_chunks_received,
             audio_overflows=stats.audio_overflows,
+            silence_flushes=stats.silence_flushes,
             inference_calls=stats.inference_calls,
             inference_empty_results=stats.inference_empty_results,
             final_sentences=stats.final_sentences,
@@ -647,6 +722,36 @@ def summarize_cache(cache: dict[str, Any]) -> str:
         else:
             parts.append(f"{key}={type(value).__name__}")
     return ", ".join(parts)
+
+
+def audio_rms(pcm_bytes: bytes, np_module: Any) -> float:
+    audio = np_module.frombuffer(pcm_bytes, dtype=np_module.int16)
+    if audio.size == 0:
+        return 0.0
+    normalized = audio.astype(np_module.float32) / 32768.0
+    return float(np_module.sqrt(np_module.mean(normalized * normalized)))
+
+
+def flush_transcript(
+    *,
+    event_queue: "queue.Queue[RuntimeEvent]",
+    stats: RuntimeStats,
+    aggregator: TranscriptAggregator,
+    ui_mode: str,
+    show_intermediate: bool,
+    final_output: Path | None,
+    punc_model: Any | None,
+    reason: str,
+    count_as_silence_flush: bool,
+) -> None:
+    events = aggregator.flush()
+    if not events:
+        return
+    if count_as_silence_flush:
+        stats.silence_flushes += 1
+    publish(event_queue, LogEvent(level="INFO", message=reason))
+    for event in events:
+        handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model)
 
 
 def append_final_output(path: Path, text: str) -> None:
