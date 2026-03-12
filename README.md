@@ -9,6 +9,7 @@
 - 使用 `FunASR` 在线流式模型做实时识别
 - 支持列出设备、预热下载模型、实时打印流式识别结果
 - 支持 TUI 终端监控面板，分区展示转写、指标、日志和调试信息
+- 支持将 `final` 结果按行追加写入文件
 
 ## 环境要求
 
@@ -62,6 +63,12 @@ uv run local-asr recognize --ui tui
 
 ```bash
 uv run local-asr recognize --ui plain
+```
+
+把 `final` 结果写入文件：
+
+```bash
+uv run local-asr recognize --final-output transcripts/live.txt
 ```
 
 指定设备：

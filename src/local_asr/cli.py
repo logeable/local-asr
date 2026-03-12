@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import queue
 import sys
 import time
@@ -116,6 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["plain", "tui"],
         default="tui",
         help="Output mode. Use `tui` for the multi-panel terminal view.",
+    )
+    recognize_parser.add_argument(
+        "--final-output",
+        type=Path,
+        default=None,
+        help="Optional file path. If set, final transcript lines are appended there.",
     )
     recognize_parser.set_defaults(handler=handle_recognize)
 
@@ -306,6 +313,7 @@ def render_stream(
                     encoder_look_back=encoder_look_back,
                     decoder_look_back=decoder_look_back,
                     is_final=False,
+                    final_output=args.final_output,
                     show_intermediate=show_intermediate,
                     ui_mode=ui_mode,
                     np_module=np_module,
@@ -322,6 +330,7 @@ def render_stream(
             chunk_size=chunk_size,
             encoder_look_back=encoder_look_back,
             decoder_look_back=decoder_look_back,
+            final_output=args.final_output,
             ui_mode=ui_mode,
             np_module=np_module,
         )
@@ -341,6 +350,7 @@ def emit_stream_result(
     encoder_look_back: int,
     decoder_look_back: int,
     is_final: bool,
+    final_output: Path | None,
     show_intermediate: bool,
     ui_mode: str,
     np_module: Any,
@@ -365,7 +375,7 @@ def emit_stream_result(
     if not isinstance(results, list):
         stats.inference_empty_results += 1
         for event in aggregator.feed("", is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate)
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output)
         publish_metrics(event_queue, stats, audio_queue_size)
         return
 
@@ -376,12 +386,12 @@ def emit_stream_result(
             continue
         emitted_text = True
         for event in aggregator.feed(text, is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate)
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output)
 
     if not emitted_text:
         stats.inference_empty_results += 1
         for event in aggregator.feed("", is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate)
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output)
 
     publish(
         event_queue,
@@ -476,6 +486,7 @@ def flush_remaining_audio(
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
     decoder_look_back: int,
+    final_output: Path | None,
     ui_mode: str,
     np_module: Any,
 ) -> None:
@@ -495,6 +506,7 @@ def flush_remaining_audio(
         encoder_look_back=encoder_look_back,
         decoder_look_back=decoder_look_back,
         is_final=True,
+        final_output=final_output,
         show_intermediate=True,
         ui_mode=ui_mode,
         np_module=np_module,
@@ -536,11 +548,13 @@ def handle_transcript_event(
     event: TranscriptEvent,
     ui_mode: str,
     show_intermediate: bool,
+    final_output: Path | None,
 ) -> None:
     publish(event_queue, event)
     if event.level == "final":
         stats.final_sentences += 1
-        publish(event_queue, LogEvent(level="INFO", message=f"Final sentence: {event.text}"))
+        if final_output is not None:
+            append_final_output(final_output, event.text)
         if ui_mode == "plain":
             print(f"[final] {event.text}")
     elif event.level == "partial" and show_intermediate and ui_mode == "plain":
@@ -561,3 +575,9 @@ def summarize_cache(cache: dict[str, Any]) -> str:
         else:
             parts.append(f"{key}={type(value).__name__}")
     return ", ".join(parts)
+
+
+def append_final_output(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text + "\n")

@@ -26,7 +26,7 @@ class SessionState:
 class TranscriptState:
     partial: str = ""
     stable: str = ""
-    final_history: Deque[str] = field(default_factory=lambda: deque(maxlen=5))
+    stable_window_chars: int = 80
 
 
 @dataclass(slots=True)
@@ -79,11 +79,10 @@ class UIState:
         if event.level == "partial":
             self.transcript.partial = event.text
         elif event.level == "stable":
-            self.transcript.stable = event.text
+            self.transcript.stable = rolling_tail(event.text, self.transcript.stable_window_chars)
         elif event.level == "final":
             self.transcript.partial = ""
             self.transcript.stable = ""
-            self.transcript.final_history.appendleft(event.text)
 
     def apply_metrics(self, event: MetricsEvent) -> None:
         self.metrics.queue_current = event.queue_current
@@ -108,3 +107,9 @@ class UIState:
 
     def apply_log(self, event: LogEvent) -> None:
         self.logs.appendleft(event)
+
+
+def rolling_tail(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]

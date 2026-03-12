@@ -68,14 +68,19 @@ def build_layout() -> Layout:
         Layout(name="body", ratio=3),
         Layout(name="bottom", ratio=2),
     )
-    layout["body"].split_row(Layout(name="transcript", ratio=2), Layout(name="metrics", ratio=1))
+    layout["body"].split_row(
+        Layout(name="stable", ratio=2),
+        Layout(name="partial", ratio=1),
+        Layout(name="metrics", ratio=1),
+    )
     layout["bottom"].split_row(Layout(name="logs", ratio=2), Layout(name="debug", ratio=1))
     return layout
 
 
 def render_layout(layout: Layout, state: UIState) -> None:
     layout["status"].update(render_status(state))
-    layout["transcript"].update(render_transcript(state))
+    layout["stable"].update(render_stable(state))
+    layout["partial"].update(render_partial(state))
     layout["metrics"].update(render_metrics(state))
     layout["logs"].update(render_logs(state))
     layout["debug"].update(render_debug(state))
@@ -95,14 +100,12 @@ def render_status(state: UIState) -> Panel:
     return Panel(status, title="Status")
 
 
-def render_transcript(state: UIState) -> Panel:
-    final_lines = list(state.transcript.final_history) or ["-"]
-    content = Group(
-        Text.assemble(("Partial\n", "bold cyan"), (state.transcript.partial or "-", "white")),
-        Text.assemble(("\nStable\n", "bold green"), (state.transcript.stable or "-", "white")),
-        Text.assemble(("\nFinal\n", "bold yellow"), ("\n".join(final_lines), "white")),
-    )
-    return Panel(content, title="Transcript")
+def render_stable(state: UIState) -> Panel:
+    return Panel(state.transcript.stable or "-", title="Stable")
+
+
+def render_partial(state: UIState) -> Panel:
+    return Panel(state.transcript.partial or "-", title="Partial")
 
 
 def render_metrics(state: UIState) -> Panel:
