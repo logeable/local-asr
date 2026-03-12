@@ -8,14 +8,11 @@ from .events import TranscriptEvent
 
 @dataclass(slots=True)
 class TranscriptAggregator:
-    stable_repeat_threshold: int = 2
     silence_timeout_s: float = 0.8
     stable_text: str = ""
     partial_text: str = ""
     last_text: str = ""
     last_nonempty_ts: float = field(default_factory=time.time)
-    pending_stable_candidate: str = ""
-    pending_stable_repeats: int = 0
 
     def feed(self, text: str, *, ts: float | None = None, is_final_chunk: bool = False) -> list[TranscriptEvent]:
         now = time.time() if ts is None else ts
@@ -29,26 +26,19 @@ class TranscriptAggregator:
 
         self.last_nonempty_ts = now
 
-        common_prefix = shared_prefix(self.last_text, text)
-        if common_prefix and common_prefix != self.pending_stable_candidate:
-            self.pending_stable_candidate = common_prefix
-            self.pending_stable_repeats = 1
-        elif common_prefix:
-            self.pending_stable_repeats += 1
-
-        if (
-            self.pending_stable_candidate
-            and self.pending_stable_repeats >= self.stable_repeat_threshold
-            and len(self.pending_stable_candidate) > len(self.stable_text)
-        ):
-            self.stable_text = self.pending_stable_candidate
-            events.append(TranscriptEvent(level="stable", text=self.stable_text, ts=now))
-
-        partial = text[len(self.stable_text) :] if text.startswith(self.stable_text) else text
-        if partial != self.partial_text:
-            self.partial_text = partial
-            if partial:
-                events.append(TranscriptEvent(level="partial", text=partial, ts=now))
+        if not self.last_text:
+            self.partial_text = text
+            self.last_text = text
+            events.append(TranscriptEvent(level="partial", text=text, ts=now))
+        elif text.startswith(self.last_text):
+            events.extend(self._update_cumulative_text(text, now))
+        elif self.last_text.startswith(text):
+            if text != self.partial_text:
+                self.partial_text = text
+                events.append(TranscriptEvent(level="partial", text=text, ts=now))
+            self.last_text = text
+        else:
+            events.extend(self._append_new_segment(text, now))
 
         self.last_text = text
 
@@ -73,8 +63,27 @@ class TranscriptAggregator:
         self.stable_text = ""
         self.partial_text = ""
         self.last_text = ""
-        self.pending_stable_candidate = ""
-        self.pending_stable_repeats = 0
+
+    def _update_cumulative_text(self, text: str, ts: float) -> list[TranscriptEvent]:
+        events: list[TranscriptEvent] = []
+        if self.last_text and len(self.last_text) > len(self.stable_text):
+            self.stable_text = self.last_text
+            events.append(TranscriptEvent(level="stable", text=self.stable_text, ts=ts))
+        partial = text[len(self.stable_text) :] if text.startswith(self.stable_text) else text
+        if partial != self.partial_text:
+            self.partial_text = partial
+            if partial:
+                events.append(TranscriptEvent(level="partial", text=partial, ts=ts))
+        return events
+
+    def _append_new_segment(self, text: str, ts: float) -> list[TranscriptEvent]:
+        events: list[TranscriptEvent] = []
+        if self.partial_text:
+            self.stable_text += self.partial_text
+            events.append(TranscriptEvent(level="stable", text=self.stable_text, ts=ts))
+        self.partial_text = text
+        events.append(TranscriptEvent(level="partial", text=text, ts=ts))
+        return events
 
 
 def shared_prefix(left: str, right: str) -> str:
