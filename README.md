@@ -10,6 +10,7 @@
 - 支持列出设备、预热下载模型、实时打印流式识别结果
 - 支持 TUI 终端监控面板，分区展示转写、指标、日志和调试信息
 - 支持将 `final` 结果按行追加写入文件
+- 支持可选的 `ct-punc` 标点恢复
 
 ## 环境要求
 
@@ -71,6 +72,12 @@ uv run local-asr recognize --ui plain
 uv run local-asr recognize --final-output transcripts/live.txt
 ```
 
+对 `final` 结果启用标点恢复：
+
+```bash
+uv run local-asr recognize --punc-model ct-punc --final-output transcripts/live.txt
+```
+
 指定设备：
 
 ```bash
@@ -106,4 +113,24 @@ uv run local-asr recognize --chunk-size 0,10,5 --encoder-look-back 4 --decoder-l
 ```bash
 uv run local-asr --help
 uv run local-asr recognize --help
+```
+
+## 单独测试标点恢复
+
+直接处理一段文本：
+
+```bash
+uv run local-asr punctuate --text "今天我们讨论一下实时语音识别的工程优化问题"
+```
+
+显式指定标点模型：
+
+```bash
+uv run local-asr punctuate --punc-model ct-punc --text "今天我们讨论一下实时语音识别的工程优化问题"
+```
+
+从文件读取并写回文件：
+
+```bash
+uv run local-asr punctuate --input-file raw.txt --output-file punctuated.txt
 ```

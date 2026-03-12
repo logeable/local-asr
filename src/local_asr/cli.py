@@ -57,10 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download the default FunASR model into the local cache without opening the microphone.",
     )
     add_model_arguments(warmup_parser)
+    add_punctuation_arguments(warmup_parser)
     warmup_parser.set_defaults(handler=handle_warmup)
 
     recognize_parser = subparsers.add_parser("recognize", help="Run real-time recognition from the microphone.")
     add_model_arguments(recognize_parser)
+    add_punctuation_arguments(recognize_parser)
     recognize_parser.add_argument(
         "--device",
         default=None,
@@ -126,6 +128,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recognize_parser.set_defaults(handler=handle_recognize)
 
+    punctuate_parser = subparsers.add_parser("punctuate", help="Run punctuation restoration on text.")
+    add_punctuation_arguments(punctuate_parser, default_model="ct-punc")
+    punctuate_parser.add_argument("--text", default=None, help="Input text to punctuate.")
+    punctuate_parser.add_argument(
+        "--input-file",
+        type=Path,
+        default=None,
+        help="Optional input text file. If set, file content is punctuated instead of --text.",
+    )
+    punctuate_parser.add_argument(
+        "--output-file",
+        type=Path,
+        default=None,
+        help="Optional output file. If set, punctuated text is written there.",
+    )
+    punctuate_parser.set_defaults(handler=handle_punctuate)
+
     return parser
 
 
@@ -156,6 +175,19 @@ def handle_devices(_: argparse.Namespace) -> None:
 def handle_warmup(args: argparse.Namespace) -> None:
     model = build_asr_model(args)
     print(f"FunASR model initialized: {model.kwargs.get('model')}")
+    if getattr(args, "punc_model", None):
+        punc_model = build_punc_model(args)
+        print(f"Punctuation model initialized: {punc_model.kwargs.get('model')}")
+
+
+def handle_punctuate(args: argparse.Namespace) -> None:
+    source_text = read_punctuation_input(args)
+    model = build_punc_model(args)
+    punctuated_text = punctuate_text(model, source_text)
+    if args.output_file is not None:
+        args.output_file.parent.mkdir(parents=True, exist_ok=True)
+        args.output_file.write_text(punctuated_text + "\n", encoding="utf-8")
+    print(punctuated_text)
 
 
 def handle_recognize(args: argparse.Namespace) -> None:
@@ -163,6 +195,7 @@ def handle_recognize(args: argparse.Namespace) -> None:
     import sounddevice as sd
 
     model = build_asr_model(args)
+    punc_model = build_punc_model(args) if args.punc_model else None
     device = parse_device(args.device)
     device_name = resolve_device_name(device)
     resolved_device_mode = detect_torch_device(args.device_mode)
@@ -243,6 +276,7 @@ def handle_recognize(args: argparse.Namespace) -> None:
                 encoder_look_back=args.encoder_look_back,
                 decoder_look_back=args.decoder_look_back,
                 final_output=args.final_output,
+                punc_model=punc_model,
                 show_intermediate=not args.hide_intermediate,
                 ui_mode=args.ui,
                 np_module=np,
@@ -313,12 +347,13 @@ def render_stream(
                     audio_queue_size=audio_queue.qsize(),
                     chunk_size=chunk_size,
                     encoder_look_back=encoder_look_back,
-                    decoder_look_back=decoder_look_back,
-                    is_final=False,
-                    final_output=final_output,
-                    show_intermediate=show_intermediate,
-                    ui_mode=ui_mode,
-                    np_module=np_module,
+                decoder_look_back=decoder_look_back,
+                is_final=False,
+                final_output=final_output,
+                punc_model=punc_model,
+                show_intermediate=show_intermediate,
+                ui_mode=ui_mode,
+                np_module=np_module,
                 )
     except KeyboardInterrupt:
         flush_remaining_audio(
@@ -333,6 +368,7 @@ def render_stream(
             encoder_look_back=encoder_look_back,
             decoder_look_back=decoder_look_back,
             final_output=final_output,
+            punc_model=punc_model,
             ui_mode=ui_mode,
             np_module=np_module,
         )
@@ -353,6 +389,7 @@ def emit_stream_result(
     decoder_look_back: int,
     is_final: bool,
     final_output: Path | None,
+    punc_model: Any | None,
     show_intermediate: bool,
     ui_mode: str,
     np_module: Any,
@@ -377,7 +414,7 @@ def emit_stream_result(
     if not isinstance(results, list):
         stats.inference_empty_results += 1
         for event in aggregator.feed("", is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output)
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model)
         publish_metrics(event_queue, stats, audio_queue_size)
         return
 
@@ -388,12 +425,12 @@ def emit_stream_result(
             continue
         emitted_text = True
         for event in aggregator.feed(text, is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output)
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model)
 
     if not emitted_text:
         stats.inference_empty_results += 1
         for event in aggregator.feed("", is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output)
+            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model)
 
     publish(
         event_queue,
@@ -421,12 +458,41 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_punctuation_arguments(parser: argparse.ArgumentParser, *, default_model: str | None = None) -> None:
+    parser.add_argument(
+        "--punc-model",
+        default=default_model,
+        help="Optional punctuation restoration model, for example `ct-punc`.",
+    )
+    parser.add_argument(
+        "--punc-model-revision",
+        default="master",
+        help="Punctuation model revision passed to FunASR.",
+    )
+
+
 def build_asr_model(args: argparse.Namespace) -> Any:
     from funasr import AutoModel
 
     return AutoModel(
         model=args.model,
         model_revision=args.model_revision,
+        device=detect_torch_device(getattr(args, "device_mode", "auto")),
+        disable_update=getattr(args, "disable_update_check", True),
+        disable_pbar=True,
+        disable_log=True,
+        ncpu=getattr(args, "ncpu", 4),
+    )
+
+
+def build_punc_model(args: argparse.Namespace) -> Any:
+    from funasr import AutoModel
+
+    if not getattr(args, "punc_model", None):
+        raise ValueError("No punctuation model configured.")
+    return AutoModel(
+        model=args.punc_model,
+        model_revision=args.punc_model_revision,
         device=detect_torch_device(getattr(args, "device_mode", "auto")),
         disable_update=getattr(args, "disable_update_check", True),
         disable_pbar=True,
@@ -489,6 +555,7 @@ def flush_remaining_audio(
     encoder_look_back: int,
     decoder_look_back: int,
     final_output: Path | None,
+    punc_model: Any | None,
     ui_mode: str,
     np_module: Any,
 ) -> None:
@@ -509,6 +576,7 @@ def flush_remaining_audio(
         decoder_look_back=decoder_look_back,
         is_final=True,
         final_output=final_output,
+        punc_model=punc_model,
         show_intermediate=True,
         ui_mode=ui_mode,
         np_module=np_module,
@@ -551,14 +619,16 @@ def handle_transcript_event(
     ui_mode: str,
     show_intermediate: bool,
     final_output: Path | None,
+    punc_model: Any | None,
 ) -> None:
     publish(event_queue, event)
     if event.level == "final":
         stats.final_sentences += 1
+        final_text = punctuate_text(punc_model, event.text) if punc_model is not None else event.text
         if final_output is not None:
-            append_final_output(final_output, event.text)
+            append_final_output(final_output, final_text)
         if ui_mode == "plain":
-            print(f"[final] {event.text}")
+            print(f"[final] {final_text}")
     elif event.level == "partial" and show_intermediate and ui_mode == "plain":
         print(f"[partial] {event.text}")
 
@@ -583,3 +653,21 @@ def append_final_output(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(text + "\n")
+
+
+def punctuate_text(model: Any | None, text: str) -> str:
+    if model is None:
+        return text
+    results = model.generate(input=text)
+    if not isinstance(results, list) or not results:
+        return text
+    punctuated = str(results[0].get("text", "")).strip()
+    return punctuated or text
+
+
+def read_punctuation_input(args: argparse.Namespace) -> str:
+    if args.input_file is not None:
+        return args.input_file.read_text(encoding="utf-8").strip()
+    if args.text:
+        return args.text.strip()
+    raise ValueError("Provide either --text or --input-file for `punctuate`.")
