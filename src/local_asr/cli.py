@@ -6,9 +6,11 @@ import queue
 import sys
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+import wave
+from typing import TYPE_CHECKING, Any, Callable
 
 from .aggregate import TranscriptAggregator
+from .endpoint import SilenceEndpointDetector
 from .events import DebugEvent, LogEvent, MetricsEvent, SessionEvent, TranscriptEvent
 from .tui import RuntimeEvent, TUIRunner
 
@@ -141,6 +143,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recognize_parser.set_defaults(handler=handle_recognize)
 
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Replay a local WAV file through the streaming pipeline and print final timing metrics.",
+    )
+    add_model_arguments(benchmark_parser)
+    add_punctuation_arguments(benchmark_parser)
+    benchmark_parser.add_argument("--audio-file", type=Path, required=True, help="Path to a 16kHz PCM WAV file.")
+    benchmark_parser.add_argument("--samplerate", type=int, default=16000, help="Expected audio sample rate.")
+    benchmark_parser.add_argument(
+        "--blocksize",
+        type=int,
+        default=960,
+        help="Frames per replay chunk. Matches microphone blocksize semantics.",
+    )
+    benchmark_parser.add_argument(
+        "--chunk-size",
+        default="0,12,6",
+        help="FunASR online chunk size, formatted as a,b,c. Default: 0,12,6.",
+    )
+    benchmark_parser.add_argument(
+        "--encoder-look-back",
+        type=int,
+        default=DEFAULT_ENCODER_LOOK_BACK,
+        help="Encoder look-back chunks for the streaming model.",
+    )
+    benchmark_parser.add_argument(
+        "--decoder-look-back",
+        type=int,
+        default=DEFAULT_DECODER_LOOK_BACK,
+        help="Decoder look-back chunks for the streaming model.",
+    )
+    benchmark_parser.add_argument(
+        "--device-mode",
+        choices=["auto", "cpu", "cuda", "mps"],
+        default="auto",
+        help="Torch device used by FunASR. Default picks mps/cuda/cpu automatically.",
+    )
+    benchmark_parser.add_argument("--ncpu", type=int, default=4, help="CPU thread count forwarded to FunASR.")
+    benchmark_parser.add_argument(
+        "--disable-update-check",
+        action="store_true",
+        help="Disable FunASR version update checks.",
+    )
+    benchmark_parser.add_argument(
+        "--final-output",
+        type=Path,
+        default=None,
+        help="Optional file path. If set, final transcript lines are appended there.",
+    )
+    benchmark_parser.add_argument(
+        "--silence-threshold",
+        type=float,
+        default=0.01,
+        help="RMS threshold for detecting silence from replayed audio chunks.",
+    )
+    benchmark_parser.add_argument(
+        "--silence-duration-ms",
+        type=int,
+        default=800,
+        help="Silence duration in milliseconds before forcing a final flush.",
+    )
+    benchmark_parser.set_defaults(handler=handle_benchmark)
+
     punctuate_parser = subparsers.add_parser("punctuate", help="Run punctuation restoration on text.")
     add_punctuation_arguments(punctuate_parser, default_model="ct-punc")
     punctuate_parser.add_argument("--text", default=None, help="Input text to punctuate.")
@@ -220,8 +285,8 @@ def handle_recognize(args: argparse.Namespace) -> None:
     audio_queue: queue.Queue[AudioChunk] = queue.Queue()
     event_queue: "queue.Queue[RuntimeEvent]" = queue.Queue()
     stats = RuntimeStats(started_at=time.time())
-    aggregator = TranscriptAggregator()
-    aggregator.silence_timeout_s = args.silence_duration_ms / 1000.0
+    aggregator = build_aggregator(args.silence_duration_ms)
+    endpoint = build_endpoint_detector(args)
     tui_runner = TUIRunner(event_queue) if args.ui == "tui" else None
 
     def callback(indata: bytes, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
@@ -285,6 +350,7 @@ def handle_recognize(args: argparse.Namespace) -> None:
                 event_queue=event_queue,
                 stats=stats,
                 aggregator=aggregator,
+                endpoint=endpoint,
                 chunk_stride=chunk_stride,
                 chunk_size=chunk_size,
                 encoder_look_back=args.encoder_look_back,
@@ -293,8 +359,6 @@ def handle_recognize(args: argparse.Namespace) -> None:
                 punc_model=punc_model,
                 show_intermediate=not args.hide_intermediate,
                 ui_mode=args.ui,
-                silence_threshold=args.silence_threshold,
-                silence_duration_ms=args.silence_duration_ms,
                 np_module=np,
             )
     except KeyboardInterrupt:
@@ -321,6 +385,83 @@ def handle_recognize(args: argparse.Namespace) -> None:
             print("\nStopped.")
 
 
+def handle_benchmark(args: argparse.Namespace) -> None:
+    import numpy as np
+
+    if args.samplerate != 16000:
+        raise ValueError("The default streaming model expects 16kHz audio. Use --samplerate 16000.")
+    audio_bytes, audio_frames, file_samplerate = load_wav_pcm(args.audio_file)
+    if file_samplerate != args.samplerate:
+        raise ValueError(f"WAV samplerate mismatch: expected {args.samplerate}, got {file_samplerate}.")
+
+    model = build_asr_model(args)
+    punc_model = build_punc_model(args) if args.punc_model else None
+    chunk_size = parse_chunk_size(args.chunk_size)
+    chunk_stride = chunk_size[1] * 960
+    stats = RuntimeStats(started_at=time.time())
+    aggregator = build_aggregator(args.silence_duration_ms)
+    endpoint = build_endpoint_detector(args)
+    event_queue: "queue.Queue[RuntimeEvent]" = queue.Queue()
+    cache: dict[str, Any] = {}
+    pending = bytearray()
+    block_bytes = args.blocksize * 2
+    processed_frames = 0
+    final_records: list[tuple[float, str]] = []
+
+    def capture_final(event: TranscriptEvent, final_text: str) -> None:
+        del event
+        final_records.append((processed_frames / args.samplerate, final_text))
+
+    for offset in range(0, len(audio_bytes), block_bytes):
+        chunk_data = audio_bytes[offset : offset + block_bytes]
+        processed_frames += len(chunk_data) // 2
+        stats.audio_chunks_received += 1
+        process_audio_chunk(
+            chunk=AudioChunk(data=chunk_data, overflowed=False),
+            model=model,
+            pending=pending,
+            cache=cache,
+            event_queue=event_queue,
+            stats=stats,
+            aggregator=aggregator,
+            endpoint=endpoint,
+            chunk_stride=chunk_stride,
+            chunk_size=chunk_size,
+            encoder_look_back=args.encoder_look_back,
+            decoder_look_back=args.decoder_look_back,
+            final_output=args.final_output,
+            punc_model=punc_model,
+            show_intermediate=False,
+            ui_mode="benchmark",
+            np_module=np,
+            on_final=capture_final,
+        )
+
+    flush_remaining_audio(
+        model=model,
+        pending=pending,
+        cache=cache,
+        event_queue=event_queue,
+        stats=stats,
+        aggregator=aggregator,
+        chunk_stride=chunk_stride,
+        chunk_size=chunk_size,
+        encoder_look_back=args.encoder_look_back,
+        decoder_look_back=args.decoder_look_back,
+        final_output=args.final_output,
+        punc_model=punc_model,
+        ui_mode="benchmark",
+        np_module=np,
+        on_final=capture_final,
+    )
+    print_benchmark_summary(
+        audio_file=args.audio_file,
+        audio_seconds=audio_frames / args.samplerate,
+        stats=stats,
+        final_records=final_records,
+    )
+
+
 def render_stream(
     model: Any,
     audio_queue: "queue.Queue[AudioChunk]",
@@ -328,6 +469,7 @@ def render_stream(
     event_queue: "queue.Queue[RuntimeEvent]",
     stats: RuntimeStats,
     aggregator: TranscriptAggregator,
+    endpoint: SilenceEndpointDetector,
     chunk_stride: int,
     chunk_size: tuple[int, int, int],
     encoder_look_back: int,
@@ -336,88 +478,33 @@ def render_stream(
     punc_model: Any | None,
     show_intermediate: bool,
     ui_mode: str,
-    silence_threshold: float,
-    silence_duration_ms: int,
     np_module: Any,
 ) -> None:
     cache: dict[str, Any] = {}
     pending = bytearray()
-    silence_started_at: float | None = None
-    silence_duration_s = silence_duration_ms / 1000.0
     try:
         while True:
             chunk = audio_queue.get()
             stats.queue_max = max(stats.queue_max, audio_queue.qsize())
-            if chunk.overflowed:
-                message = "Input overflow detected; consider increasing --blocksize"
-                publish(event_queue, LogEvent(level="WARN", message=message))
-                if ui_mode == "plain":
-                    print(f"\n[warn] {message}.")
-            pending.extend(chunk.data)
-            step_bytes = chunk_stride * 2
-            while len(pending) >= step_bytes:
-                current = bytes(pending[:step_bytes])
-                del pending[:step_bytes]
-                emit_stream_result(
-                    model=model,
-                    pcm_bytes=current,
-                    cache=cache,
-                    event_queue=event_queue,
-                    stats=stats,
-                    aggregator=aggregator,
-                    audio_queue_size=audio_queue.qsize(),
-                    chunk_size=chunk_size,
-                    encoder_look_back=encoder_look_back,
-                    decoder_look_back=decoder_look_back,
-                    is_final=False,
-                    final_output=final_output,
-                    punc_model=punc_model,
-                    show_intermediate=show_intermediate,
-                    ui_mode=ui_mode,
-                    np_module=np_module,
-                )
-            chunk_rms = audio_rms(chunk.data, np_module)
-            now = time.time()
-            if chunk_rms >= silence_threshold:
-                silence_started_at = None
-                continue
-            silence_started_at = now if silence_started_at is None else silence_started_at
-            if not aggregator.has_pending_text() or now - silence_started_at < silence_duration_s:
-                continue
-            if pending:
-                padded = bytes(pending) + b"\x00" * max(0, step_bytes - len(pending))
-                pending.clear()
-                emit_stream_result(
-                    model=model,
-                    pcm_bytes=padded[:step_bytes],
-                    cache=cache,
-                    event_queue=event_queue,
-                    stats=stats,
-                    aggregator=aggregator,
-                    audio_queue_size=audio_queue.qsize(),
-                    chunk_size=chunk_size,
-                    encoder_look_back=encoder_look_back,
-                    decoder_look_back=decoder_look_back,
-                    is_final=False,
-                    final_output=final_output,
-                    punc_model=punc_model,
-                    show_intermediate=show_intermediate,
-                    ui_mode=ui_mode,
-                    np_module=np_module,
-                )
-            flush_transcript(
+            process_audio_chunk(
+                chunk=chunk,
+                model=model,
+                pending=pending,
+                cache=cache,
                 event_queue=event_queue,
                 stats=stats,
                 aggregator=aggregator,
-                ui_mode=ui_mode,
-                show_intermediate=show_intermediate,
+                endpoint=endpoint,
+                chunk_stride=chunk_stride,
+                chunk_size=chunk_size,
+                encoder_look_back=encoder_look_back,
+                decoder_look_back=decoder_look_back,
                 final_output=final_output,
                 punc_model=punc_model,
-                reason="Silence flush triggered",
-                count_as_silence_flush=True,
+                show_intermediate=show_intermediate,
+                ui_mode=ui_mode,
+                np_module=np_module,
             )
-            publish_metrics(event_queue, stats, audio_queue.qsize())
-            silence_started_at = None
     except KeyboardInterrupt:
         flush_remaining_audio(
             model=model,
@@ -434,8 +521,101 @@ def render_stream(
             punc_model=punc_model,
             ui_mode=ui_mode,
             np_module=np_module,
+            on_final=None,
         )
         raise
+
+
+def process_audio_chunk(
+    *,
+    chunk: AudioChunk,
+    model: Any,
+    pending: bytearray,
+    cache: dict[str, Any],
+    event_queue: "queue.Queue[RuntimeEvent]",
+    stats: RuntimeStats,
+    aggregator: TranscriptAggregator,
+    endpoint: SilenceEndpointDetector,
+    chunk_stride: int,
+    chunk_size: tuple[int, int, int],
+    encoder_look_back: int,
+    decoder_look_back: int,
+    final_output: Path | None,
+    punc_model: Any | None,
+    show_intermediate: bool,
+    ui_mode: str,
+    np_module: Any,
+    on_final: Callable[[TranscriptEvent, str], None] | None = None,
+) -> None:
+    if chunk.overflowed:
+        message = "Input overflow detected; consider increasing --blocksize"
+        publish(event_queue, LogEvent(level="WARN", message=message))
+        if ui_mode == "plain":
+            print(f"\n[warn] {message}.")
+    pending.extend(chunk.data)
+    step_bytes = chunk_stride * 2
+    while len(pending) >= step_bytes:
+        current = bytes(pending[:step_bytes])
+        del pending[:step_bytes]
+        emit_stream_result(
+            model=model,
+            pcm_bytes=current,
+            cache=cache,
+            event_queue=event_queue,
+            stats=stats,
+            aggregator=aggregator,
+            audio_queue_size=0,
+            chunk_size=chunk_size,
+            encoder_look_back=encoder_look_back,
+            decoder_look_back=decoder_look_back,
+            is_final=False,
+            final_output=final_output,
+            punc_model=punc_model,
+            show_intermediate=show_intermediate,
+            ui_mode=ui_mode,
+            np_module=np_module,
+            on_final=on_final,
+        )
+    chunk_rms = audio_rms(chunk.data, np_module)
+    if not endpoint.observe(chunk_rms, has_pending_text=aggregator.has_pending_text()):
+        publish_metrics(event_queue, stats, 0)
+        return
+    if pending:
+        padded = bytes(pending) + b"\x00" * max(0, step_bytes - len(pending))
+        pending.clear()
+        emit_stream_result(
+            model=model,
+            pcm_bytes=padded[:step_bytes],
+            cache=cache,
+            event_queue=event_queue,
+            stats=stats,
+            aggregator=aggregator,
+            audio_queue_size=0,
+            chunk_size=chunk_size,
+            encoder_look_back=encoder_look_back,
+            decoder_look_back=decoder_look_back,
+            is_final=False,
+            final_output=final_output,
+            punc_model=punc_model,
+            show_intermediate=show_intermediate,
+            ui_mode=ui_mode,
+            np_module=np_module,
+            on_final=on_final,
+        )
+    flush_transcript(
+        event_queue=event_queue,
+        stats=stats,
+        aggregator=aggregator,
+        ui_mode=ui_mode,
+        show_intermediate=show_intermediate,
+        final_output=final_output,
+        punc_model=punc_model,
+        reason="Silence flush triggered",
+        count_as_silence_flush=True,
+        on_final=on_final,
+    )
+    publish_metrics(event_queue, stats, 0)
+    endpoint.reset()
 
 
 def emit_stream_result(
@@ -456,6 +636,7 @@ def emit_stream_result(
     show_intermediate: bool,
     ui_mode: str,
     np_module: Any,
+    on_final: Callable[[TranscriptEvent, str], None] | None = None,
 ) -> None:
     audio = np_module.frombuffer(pcm_bytes, dtype=np_module.int16).astype(np_module.float32) / 32768.0
     start = time.perf_counter()
@@ -477,7 +658,9 @@ def emit_stream_result(
     if not isinstance(results, list):
         stats.inference_empty_results += 1
         for event in aggregator.feed("", is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model)
+            handle_transcript_event(
+                event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model, on_final
+            )
         publish_metrics(event_queue, stats, audio_queue_size)
         return
 
@@ -488,12 +671,16 @@ def emit_stream_result(
             continue
         emitted_text = True
         for event in aggregator.feed(text, is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model)
+            handle_transcript_event(
+                event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model, on_final
+            )
 
     if not emitted_text:
         stats.inference_empty_results += 1
         for event in aggregator.feed("", is_final_chunk=is_final):
-            handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model)
+            handle_transcript_event(
+                event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model, on_final
+            )
 
     publish(
         event_queue,
@@ -583,6 +770,19 @@ def parse_chunk_size(raw_value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in parts)
 
 
+def build_aggregator(silence_duration_ms: int) -> TranscriptAggregator:
+    aggregator = TranscriptAggregator()
+    aggregator.silence_timeout_s = silence_duration_ms / 1000.0
+    return aggregator
+
+
+def build_endpoint_detector(args: argparse.Namespace) -> SilenceEndpointDetector:
+    return SilenceEndpointDetector(
+        threshold=args.silence_threshold,
+        duration_s=args.silence_duration_ms / 1000.0,
+    )
+
+
 def parse_device(raw_device: str | None) -> int | str | None:
     if raw_device is None:
         return None
@@ -621,6 +821,7 @@ def flush_remaining_audio(
     punc_model: Any | None,
     ui_mode: str,
     np_module: Any,
+    on_final: Callable[[TranscriptEvent, str], None] | None = None,
 ) -> None:
     step_bytes = chunk_stride * 2
     if pending:
@@ -642,6 +843,7 @@ def flush_remaining_audio(
             show_intermediate=True,
             ui_mode=ui_mode,
             np_module=np_module,
+            on_final=on_final,
         )
         return
     flush_transcript(
@@ -654,6 +856,7 @@ def flush_remaining_audio(
         punc_model=punc_model,
         reason="Stream stopped; flushed pending transcript",
         count_as_silence_flush=False,
+        on_final=on_final,
     )
 
 
@@ -695,6 +898,7 @@ def handle_transcript_event(
     show_intermediate: bool,
     final_output: Path | None,
     punc_model: Any | None,
+    on_final: Callable[[TranscriptEvent, str], None] | None = None,
 ) -> None:
     publish(event_queue, event)
     if event.level == "final":
@@ -702,6 +906,8 @@ def handle_transcript_event(
         final_text = punctuate_text(punc_model, event.text) if punc_model is not None else event.text
         if final_output is not None:
             append_final_output(final_output, final_text)
+        if on_final is not None:
+            on_final(event, final_text)
         if ui_mode == "plain":
             print(f"[final] {final_text}")
     elif event.level == "partial" and show_intermediate and ui_mode == "plain":
@@ -743,6 +949,7 @@ def flush_transcript(
     punc_model: Any | None,
     reason: str,
     count_as_silence_flush: bool,
+    on_final: Callable[[TranscriptEvent, str], None] | None = None,
 ) -> None:
     events = aggregator.flush()
     if not events:
@@ -751,7 +958,7 @@ def flush_transcript(
         stats.silence_flushes += 1
     publish(event_queue, LogEvent(level="INFO", message=reason))
     for event in events:
-        handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model)
+        handle_transcript_event(event_queue, stats, event, ui_mode, show_intermediate, final_output, punc_model, on_final)
 
 
 def append_final_output(path: Path, text: str) -> None:
@@ -776,3 +983,33 @@ def read_punctuation_input(args: argparse.Namespace) -> str:
     if args.text:
         return args.text.strip()
     raise ValueError("Provide either --text or --input-file for `punctuate`.")
+
+
+def load_wav_pcm(path: Path) -> tuple[bytes, int, int]:
+    with wave.open(str(path), "rb") as wav_file:
+        if wav_file.getsampwidth() != 2:
+            raise ValueError("Only 16-bit PCM WAV files are supported for benchmark.")
+        if wav_file.getnchannels() != 1:
+            raise ValueError("Only mono WAV files are supported for benchmark.")
+        samplerate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+        return wav_file.readframes(frame_count), frame_count, samplerate
+
+
+def print_benchmark_summary(
+    *,
+    audio_file: Path,
+    audio_seconds: float,
+    stats: RuntimeStats,
+    final_records: list[tuple[float, str]],
+) -> None:
+    avg_infer_ms = stats.total_infer_ms / stats.inference_calls if stats.inference_calls else 0.0
+    print(f"audio_file={audio_file}")
+    print(f"audio_seconds={audio_seconds:.2f}")
+    print(f"inference_calls={stats.inference_calls}")
+    print(f"empty_results={stats.inference_empty_results}")
+    print(f"final_sentences={stats.final_sentences}")
+    print(f"silence_flushes={stats.silence_flushes}")
+    print(f"avg_infer_ms={avg_infer_ms:.1f}")
+    for index, (offset_s, text) in enumerate(final_records, start=1):
+        print(f"[{index}] t={offset_s:.2f}s {text}")

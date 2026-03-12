@@ -11,6 +11,8 @@
 - 支持 TUI 终端监控面板，分区展示转写、指标、日志和调试信息
 - 支持将 `final` 结果按行追加写入文件
 - 支持可选的 `ct-punc` 标点恢复
+- 支持基于静音阈值的句尾判定
+- 支持用本地 WAV 文件离线 replay 流式链路并输出 benchmark 摘要
 
 ## 环境要求
 
@@ -108,11 +110,31 @@ uv run local-asr recognize --device-mode mps
 uv run local-asr recognize --chunk-size 0,10,5 --encoder-look-back 4 --decoder-look-back 1
 ```
 
+调整句尾静音判定：
+
+```bash
+uv run local-asr recognize --silence-threshold 0.02 --silence-duration-ms 600
+```
+
 ## 命令帮助
 
 ```bash
 uv run local-asr --help
 uv run local-asr recognize --help
+```
+
+## 离线 replay / benchmark
+
+用本地 `16kHz` 单声道 `PCM WAV` 文件重放整条流式链路，方便比较参数和观察 `final` 行为：
+
+```bash
+uv run local-asr benchmark --audio-file sample.wav
+```
+
+带标点恢复和结果写文件：
+
+```bash
+uv run local-asr benchmark --audio-file sample.wav --punc-model ct-punc --final-output transcripts/benchmark.txt
 ```
 
 ## 单独测试标点恢复
